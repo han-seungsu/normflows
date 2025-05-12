@@ -9,56 +9,41 @@ from Base import DirichletProcessGaussianMixture, DPGM, MixtureBaseDistribution
 
 import torch
 
+def _print_tensor(name, tensor, max_entries=5):
+    data = tensor.detach().cpu().numpy().ravel()
+    if data.size > max_entries:
+        summary = ", ".join(f"{x:.4f}" for x in data[:max_entries]) + ", …"
+    else:
+        summary = ", ".join(f"{x:.4f}" for x in data)
+    print(f"  {name}: [{summary}]")
+
 def print_model_parameters(q0):
     """
-    주어진 model.q0 객체의 모든 파라미터와 버퍼를 출력합니다.
-    - log_eta, log_scale, log_alpha는 exp() 적용
-    - 길이 5 이상이면 앞의 5개만 출력
-    - submodule이 없으면 q0 자체를 base로 간주하여 출력
-    - base2.log_eta와 logits가 있을 때만 추가 출력
+    주어진 DirichletProcessMixture (혹은 BaseDistribution) 객체의
+    variational 파라미터 및 buffer를 출력합니다.
     """
-    submodules = list(q0.children())
-    if not submodules:
-        submodules = [q0]
+    # 1) Top‐level stick-breaking params
+    if hasattr(q0, 'log_a'):
+        print("--- stick-breaking params ---")
+        _print_tensor("a", torch.exp(q0.log_a))
+        _print_tensor("b", torch.exp(q0.log_b))
+        _print_tensor("pi (expected)", q0.pi)
+        print()
 
-    for base in submodules:
-        class_name = base.__class__.__name__
-        print(f"--- base {class_name} ---")
-
-        # 1) parameters
-        for name, param in base.named_parameters(recurse=False):
-            _print_tensor(name, param.data)
-
-        # 2) buffers
-        for name, buf in base.named_buffers(recurse=False):
+    # 2) 자식 모듈(components) 순회
+    for idx, comp in enumerate(getattr(q0, 'components', [q0])):
+        print(f"--- component #{idx} ({comp.__class__.__name__}) ---")
+        # parameters
+        for name, param in comp.named_parameters(recurse=False):
+            val = param
+            if name == 'log_scale':
+                name = 'scale'
+                val = torch.exp(param)
+            _print_tensor(name, val)
+        # buffers (e.g. df)
+        for name, buf in comp.named_buffers(recurse=False):
             _print_tensor(name, buf)
-
-    # extra prints
-    if hasattr(q0, 'base2') and hasattr(q0.base2, 'log_eta'):
-        print("eta:")
-        print(torch.exp(q0.base2.log_eta))
-
-    if hasattr(q0, 'logits'):
-        print("weight:")
-        print(torch.softmax(q0.logits, dim=-1))
-
-
-def _print_tensor(name, tensor):
-    """Helper to apply exp, head-5 logic, and label printing."""
-    if name in ['log_eta', 'log_scale', 'log_alpha']:
-        val = tensor.exp()
-        label = name.replace('log_', '')
-    else:
-        val = tensor
-        label = name
-
-    print(f"{label}: ", end='')
-    flat = val.view(-1)
-    if flat.numel() > 5:
-        print(flat[:5].detach().numpy(), "...")  
-    else:
-        print(flat.detach().numpy())
-    print()
+        print()
 
 
 def plot_samples(dist, num_samples = 10000, show = 1, save_img=False, size=10, two_d = True, min = None, max = None, density = True):

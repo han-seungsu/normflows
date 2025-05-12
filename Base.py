@@ -5,16 +5,16 @@ import numpy as np
 
 from normflows.distributions import BaseDistribution
 from torch.distributions import StudentT
+from math import lgamma, pi
 
 # 1. DirichletProcessGaussianMixture
-# 2. DPGM (Gumbel-softmax)
+# 2. DPGM 
 # 3. DirichletProcessPoductTMixture
 # 4. DirichletProcessMultivariateTMixture
-# 5. MixtureBase
+# 5. DPGTM (Dirichlet Process Gaussian T Mixture)
 
 #####################################################################################
 #####################################################################################
-
 
 class DirichletProcessGaussianMixture(BaseDistribution):
 
@@ -167,162 +167,138 @@ class DirichletProcessGaussianMixture(BaseDistribution):
 #####################################################################################
 
 class DPGM(BaseDistribution):
-    """
-    Truncated Dirichlet Process + Gumbel-Softmax mixture of Gaussians, 
-    with attempt to let grad flow to eta by removing detach/no_grad in update_beta.
-    NOTE: actual gradient might still be small or partial, 
-          because uniform sampling is not a perfect reparameterization.
-    """
-
     def __init__(
         self,
         shape,
         T=3,
-        train_eta=True,
+        alpha=1.0,
+        train_alpha=True,
         train_means=True,
-        train_scale=True,
-        tau=0.1
+        train_scales=True,
+        init_means=None,
+        init_scales=None,
     ):
         super().__init__()
-        if isinstance(shape, int):
-            shape = (shape,)
-        elif isinstance(shape, list):
-            shape = tuple(shape)
-
-        self.shape = shape  
-        self.d = np.prod(shape)  
+        # shape handling
+        if isinstance(shape, int): shape = (shape,)
+        elif isinstance(shape, list): shape = tuple(shape)
+        self.shape = shape
+        self.d = int(np.prod(shape))
         self.T = T
-        self.tau = tau
 
-        # 1) eta => log_eta
-        if train_eta:
-            # 초기 예: log_eta=1.5 => eta=exp(1.5)=~4.48
-            self.log_eta = nn.Parameter(torch.tensor(0.0))
+        # concentration alpha (log-space)
+        init_alpha = torch.tensor(alpha, dtype=torch.float32)
+        if train_alpha:
+            self.log_alpha = nn.Parameter(torch.log(init_alpha))
         else:
-            self.register_buffer("log_eta", torch.tensor(0.0))
+            self.register_buffer("log_alpha", torch.log(init_alpha))
 
-        # 2) means => shape=(T,*shape), 예: 스케일 크게
-        init_means = torch.randn(T, *shape) * 1.0
+        # variational stick-breaking params (log-space for positivity)
+        self.log_a = nn.Parameter(torch.zeros(T-1))
+        self.log_b = nn.Parameter(torch.log(torch.ones(T-1) * alpha))
+
+        # component means [T, d]
+        if init_means is None:
+            means = torch.randn(T, self.d) * 2.0
+        else:
+            means = torch.tensor(init_means, dtype=torch.float32)
         if train_means:
-            self.means = nn.Parameter(init_means)
+            self.means = nn.Parameter(means)
         else:
-            self.register_buffer("means", init_means)
+            self.register_buffer("means", means)
 
-        # 3) single diagonal scale
-        init_log_scale = torch.zeros(*shape)
-        if train_scale:
-            self.log_scale = nn.Parameter(init_log_scale)
+        # component log_scales [T, d]
+        if init_scales is None:
+            log_scales = torch.zeros(T, self.d)
         else:
-            self.register_buffer("log_scale", init_log_scale)
+            log_scales = torch.log(torch.tensor(init_scales, dtype=torch.float32))
+        if train_scales:
+            self.log_scale = nn.Parameter(log_scales)
+        else:
+            self.register_buffer("log_scale", log_scales)
 
-        # 4) pi, log_pi (버퍼 or 일반 속성)
+        # expected weights buffer
         self.register_buffer("pi", torch.zeros(T))
         self.register_buffer("log_pi", torch.zeros(T))
+        # initialize expected weights
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.copy_(pi_mean)
+        self.log_pi.copy_(log_pi_mean)
 
-        # first init => sample pi
-        self.update_beta()
-
-    def update_beta(self):
-        """
-        Remove detach() and no_grad(), 
-        so that self.log_eta -> pi might remain in the autograd graph.
-        Still, random sampling from Uniform means partial grad for eta won't be fully accurate 
-        unless we do a bigger reparam approach.
-        """
-        device = self.log_eta.device
-        # eta in the graph
-        eta = torch.exp(self.log_eta)  # no detach
-
-        # random uniform => still a non-differentiable operation wrt eta
-        u = torch.rand(self.T - 1, device=device)
-
-        # stick-breaking
-        beta = 1.0 - (1.0 - u)**(1.0 / eta)  # shape=(T-1,)
+    def _compute_expected_pi(self):
+        # compute expected stick-breaking weights under Beta(a,b)
+        a = torch.exp(self.log_a)
+        b = torch.exp(self.log_b)
+        v_mean = a / (a + b)
         pis = []
-        prod_term = torch.tensor(1.0, device=device)
-        for i in range(self.T - 1):
-            b_i = beta[i]
-            pi_i = b_i * prod_term
-            pis.append(pi_i)
-            prod_term = prod_term * (1.0 - b_i)
-        pis.append(prod_term)
-        pi_tensor = torch.stack(pis, dim=0)
-
-        # direct assignment => now pi, log_pi might keep the graph
-        # but note that "pi_tensor" includes random ops from uniform...
-        self.pi = pi_tensor
-        self.log_pi = torch.log(pi_tensor + 1e-12)
-
-    def _gumbel_softmax(self, log_pi, tau, num_samples):
-        device = log_pi.device
-        g = -torch.log(-torch.log(torch.rand(num_samples, self.T, device=device)))
-        logits = log_pi.unsqueeze(0) + g
-        c = torch.softmax(logits / tau, dim=1)
-        return c
+        remaining = torch.ones((), device=a.device)
+        for k in range(self.T - 1):
+            pis.append(v_mean[k] * remaining)
+            remaining = remaining * (1 - v_mean[k])
+        pis.append(remaining)
+        pi_mean = torch.stack(pis, dim=0)
+        return pi_mean, torch.log(pi_mean + 1e-12)
 
     def forward(self, num_samples=1):
-        """
-        Sample z using Gumbel-Softmax cluster selection => c
-        Then approximate log_p.
-        """
-        device = self.log_pi.device
-        c = self._gumbel_softmax(self.log_pi, self.tau, num_samples)
+        device = self.means.device
+        # update expected weights from a,b
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.copy_(pi_mean)
+        self.log_pi.copy_(log_pi_mean)
 
-        scale = torch.exp(self.log_scale)
-        eps = torch.randn((num_samples,) + self.shape, device=device)
+        # sample stick-breaking vars and modes
+        a = torch.exp(self.log_a).unsqueeze(0)
+        b = torch.exp(self.log_b).unsqueeze(0)
+        U = torch.rand(num_samples, self.T - 1, device=device)
+        V = (1 - (1 - U)**(1.0 / b))**(1.0 / a)
+        V = V.clamp(min=1e-6, max=1-1e-6)
+        one_minus_V = 1 - V
+        cumprod_om = torch.cumprod(one_minus_V, dim=1)
+        prod_prev = torch.cat([torch.ones(num_samples,1,device=device), cumprod_om[:,:-1]], dim=1)
+        pi_mat = torch.cat([V * prod_prev[:,:self.T-1], prod_prev[:,-1:]], dim=1)
+        pi_mat = pi_mat / pi_mat.sum(dim=1, keepdim=True)
 
-        means_expand = self.means.unsqueeze(0)  
-        c_expand = c.unsqueeze(-1)
-        for _ in range(len(self.shape) - 1):
-            c_expand = c_expand.unsqueeze(-1)
+        modes = torch.multinomial(pi_mat, 1).squeeze(1)
 
-        weighted_means = (means_expand * c_expand).sum(dim=1)
-        z = weighted_means + scale * eps
+        # sample Gaussian for each sample
+        eps = torch.randn(num_samples, self.d, device=device)
+        loc = self.means[modes]
+        scale = torch.exp(self.log_scale)[modes]
+        z = loc + eps * scale
+        z = z.view(num_samples, *self.shape)
 
-        # approximate log_p
-        z_expand = z.unsqueeze(1)
-        means_2 = self.means.unsqueeze(0)
-        diff = (z_expand - means_2) / scale
-        diff_sq = 0.5 * (diff**2).sum(dim=list(range(2, 2 + len(self.shape))))
-        sum_log_scale = torch.sum(torch.log(scale))
-        log_gauss = (
-            -0.5 * self.d * np.log(2.0 * np.pi)
-            - sum_log_scale
-            - diff_sq
-        )  # shape=(num_samples, T)
+        # compute log probability using expected weights (self.log_pi)
+        # evaluate gaussians for all components
+        z_flat = z.view(num_samples, self.d)
+        means = self.means.unsqueeze(0)  # [1,T,d]
+        scales = torch.exp(self.log_scale).unsqueeze(0)  # [1,T,d]
+        eps_z = (z_flat.unsqueeze(1) - means) / scales
+        log_gauss = (-0.5 * self.d * np.log(2*np.pi)
+                     - torch.sum(torch.log(scales), dim=2)
+                     - 0.5 * torch.sum(eps_z**2, dim=2))  # [N,T]
+        log_comp = log_gauss + self.log_pi.unsqueeze(0)  # [N,T]
+        log_prob = torch.logsumexp(log_comp, dim=1)  # [N]
 
-        expand_log_pi = self.log_pi.unsqueeze(0)
-        mixture_term = expand_log_pi + log_gauss
-        log_p_i = (c * mixture_term).sum(dim=1)
+        return z, log_prob
 
-        return z, log_p_i
-    
     def log_prob(self, z):
-        """
-        Mixture log p(z) with fixed pi (non-random).
-        """
-        if z.dim() == 1 + len(self.shape):
-            batch_size = z.size(0)
-        else:
-            raise ValueError(f"z must have shape=(batch_size, {self.shape})")
+        # always use expected weights
+        device = self.means.device
+        num_samples = z.shape[0]
+        # update expected weights
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.copy_(pi_mean)
+        self.log_pi.copy_(log_pi_mean)
 
-        device = self.log_pi.device
-        scale = torch.exp(self.log_scale)
-
-        z_expand = z.unsqueeze(1)
-        means_expand = self.means.unsqueeze(0)
-        diff = (z_expand - means_expand) / scale
-        diff_sq = 0.5 * torch.sum(diff**2, dim=list(range(2, 2 + len(self.shape))))
-        sum_log_scale = torch.sum(torch.log(scale))
-
-        log_gauss = (
-            -0.5 * self.d * np.log(2.0 * np.pi)
-            - sum_log_scale
-            - diff_sq
-        )
-        pi_expand = self.pi.unsqueeze(0)
-        log_mix = torch.logsumexp(torch.log(pi_expand) + log_gauss, dim=1)
-        return log_mix
+        z_flat = z.view(num_samples, self.d)
+        means = self.means.unsqueeze(0)
+        scales = torch.exp(self.log_scale).unsqueeze(0)
+        eps_z = (z_flat.unsqueeze(1) - means) / scales
+        log_gauss = (-0.5 * self.d * np.log(2*np.pi)
+                     - torch.sum(torch.log(scales), dim=2)
+                     - 0.5 * torch.sum(eps_z**2, dim=2))
+        log_comp = log_gauss + log_pi_mean.unsqueeze(0)
+        return torch.logsumexp(log_comp, dim=1)
 
 #####################################################################################
 #####################################################################################
@@ -492,11 +468,12 @@ class DirichletProcessPoductTMixture(BaseDistribution):
         log_p       = torch.logsumexp(comp_log_p, dim=1)                        # (N,)
 
         return log_p
-    
 
 #####################################################################################
 #####################################################################################
+
 class MixtureBaseDistribution(BaseDistribution):
+    
     def __init__(self, base1, base2, trainable=True, initial_weights=None):
         super().__init__()
         self.base1 = base1
@@ -583,3 +560,213 @@ class MixtureBaseDistribution(BaseDistribution):
         fallback = logp1 + torch.log(weights[0])
         log_prob = torch.where(mask, fallback, torch.logsumexp(mixture, dim=0))
         return log_prob
+    
+
+#####################################################################################
+#####################################################################################
+
+class GaussianDistribution(BaseDistribution):
+    def __init__(self, shape, mean=None, scale=None):
+        super().__init__()
+        if isinstance(shape, int): shape = (shape,)
+        self.shape = shape
+        d = int(np.prod(shape))
+        if mean is None:
+            mean = torch.zeros(d)
+        if scale is None:
+            log_scale = torch.zeros(d)
+        else:
+            log_scale = torch.log(torch.tensor(scale, dtype=torch.float32))
+        self.mean = nn.Parameter(mean)
+        self.log_scale = nn.Parameter(log_scale)
+
+    def forward(self, num_samples=1):
+        eps = torch.randn(num_samples, *self.shape, device=self.mean.device)
+        scale = torch.exp(self.log_scale).view(1, *self.shape)
+        samples = eps * scale + self.mean.view(1, *self.shape)
+        log_p = self.log_prob(samples)
+        return samples, log_p
+
+    def log_prob(self, z):
+        z_flat = z.view(z.shape[0], -1)
+        mu = self.mean.view(1, -1)
+        sigma = torch.exp(self.log_scale).view(1, -1)
+        lp = -0.5 * ((z_flat - mu)/sigma)**2 - torch.log(sigma) - 0.5 * np.log(2*pi)
+        return lp.sum(dim=1)
+
+class TProductDistribution(BaseDistribution):
+    def __init__(self, shape, mean=None, scale=None, df=None):
+        super().__init__()
+        if isinstance(shape, int): shape = (shape,)
+        self.shape = shape
+        d = int(np.prod(shape))
+        if mean is None:
+            mean = torch.zeros(d)
+        if scale is None:
+            log_scale = torch.zeros(d)
+        else:
+            log_scale = torch.log(torch.tensor(scale, dtype=torch.float32))
+        if df is None:
+            df_buf = torch.full((d,), 2.0)
+        else:
+            df_buf = torch.tensor(df, dtype=torch.float32).view(d,)
+        self.mean = nn.Parameter(mean)
+        self.log_scale = nn.Parameter(log_scale)
+        self.register_buffer('df', df_buf)
+
+    def forward(self, num_samples=1):
+        df = self.df.view(1, *self.shape)
+        eps = torch.distributions.StudentT(df).rsample((num_samples,))
+        scale = torch.exp(self.log_scale).view(1, *self.shape)
+        samples = eps * scale + self.mean.view(1, *self.shape)
+        log_p = self.log_prob(samples)
+        return samples, log_p
+
+    def log_prob(self, z):
+        z_flat = z.view(z.shape[0], -1)
+        mu = self.mean.view(1, -1)
+        sigma = torch.exp(self.log_scale).view(1, -1)
+        df = self.df.view(1, -1)
+        x = (z_flat - mu) / sigma
+        coef = lgamma((df+1)/2) - lgamma(df/2) - 0.5*(torch.log(df*pi) + 2*torch.log(sigma))
+        lp = coef - ((df+1)/2)*torch.log(1 + x**2/df)
+        return lp.sum(dim=1)
+
+class MultivariateTDistribution(BaseDistribution):
+    def __init__(self, shape, mean=None, scale=None, df=None):
+        super().__init__()
+        if isinstance(shape, int): shape = (shape,)
+        self.shape = shape
+        self.d = int(np.prod(shape))
+        if mean is None:
+            mean = torch.zeros(self.d)
+        if scale is None:
+            log_scale = torch.zeros(self.d)
+        else:
+            log_scale = torch.log(torch.tensor(scale, dtype=torch.float32))
+        if df is None:
+            df_val = float(self.d + 1)
+        else:
+            df_val = float(df)
+        self.mean = nn.Parameter(mean)
+        self.log_scale = nn.Parameter(log_scale)
+        self.register_buffer('df', torch.tensor(df_val, dtype=torch.float32))
+
+    def forward(self, num_samples=1):
+        eps = torch.distributions.StudentT(self.df).rsample((num_samples, self.d))
+        scale = torch.exp(self.log_scale).view(1, -1)
+        samples = eps * scale + self.mean.view(1, -1)
+        samples = samples.view(num_samples, *self.shape)
+        log_p = self.log_prob(samples)
+        return samples, log_p
+
+    def log_prob(self, z):
+        z_flat = z.view(z.shape[0], self.d)
+        mu = self.mean.view(1, -1)
+        sigma = torch.exp(self.log_scale).view(1, -1)
+        df = self.df
+        x = (z_flat - mu) / sigma
+        m = torch.sum(x**2, dim=1)
+        d = float(self.d)
+        lp = lgamma((df + d)/2) - lgamma(df/2)
+        lp = lp - 0.5*(d*torch.log(df*pi) + 2*torch.sum(torch.log(sigma)))
+        lp = lp - ((df + d)/2)*torch.log1p(m/df)
+        return lp
+
+class DirichletProcessMixture(BaseDistribution):
+    def __init__(
+        self,
+        shape,
+        components=None,
+        T=None,
+        alpha=1.0,
+        train_alpha=True,
+    ):
+        super().__init__()
+        # record shape for sampling
+        if isinstance(shape, int): shape = (shape,)
+        self.shape = shape
+        # default T=30 if no components provided
+        if components is None:
+            T = T or 30
+            comps = []
+            for _ in range(T):
+                mean = torch.randn(int(np.prod(self.shape))) * 2.0
+                comps.append(GaussianDistribution(self.shape, mean=mean))
+            self.components = nn.ModuleList(comps)
+            self.T = T
+        else:
+            self.components = nn.ModuleList(components)
+            self.T = len(self.components) if T is None else T
+            assert self.T == len(self.components), "T must match number of components"
+
+        # concentration alpha
+        init_alpha = torch.tensor(alpha, dtype=torch.float32)
+        if train_alpha:
+            self.log_alpha = nn.Parameter(torch.log(init_alpha))
+        else:
+            self.register_buffer("log_alpha", torch.log(init_alpha))
+
+        # variational stick-breaking parameters
+        self.log_a = nn.Parameter(torch.zeros(self.T - 1))
+        self.log_b = nn.Parameter(torch.log(torch.ones(self.T - 1) * alpha))
+
+        # buffers for expected weights (no grad)
+        self.register_buffer("pi", torch.zeros(self.T))
+        self.register_buffer("log_pi", torch.zeros(self.T))
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+    def _compute_expected_pi(self):
+        a = torch.exp(self.log_a)
+        b = torch.exp(self.log_b)
+        v_mean = a / (a + b)
+        pis = []
+        remaining = torch.ones((), device=a.device)
+        for k in range(self.T - 1):
+            pis.append(v_mean[k] * remaining)
+            remaining = remaining * (1 - v_mean[k])
+        pis.append(remaining)
+        return torch.stack(pis, dim=0), torch.log(torch.stack(pis, dim=0) + 1e-12)
+
+    def forward(self, num_samples=1):
+        device = self.log_alpha.device
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+        a = torch.exp(self.log_a).unsqueeze(0)
+        b = torch.exp(self.log_b).unsqueeze(0)
+        U = torch.rand(num_samples, self.T - 1, device=device)
+        V = (1 - (1 - U)**(1.0 / b))**(1.0 / a)
+        V = V.clamp(min=1e-6, max=1-1e-6)
+
+        one_minus_V = 1 - V
+        cumprod_om = torch.cumprod(one_minus_V, dim=1)
+        prod_prev = torch.cat([torch.ones(num_samples,1,device=device), cumprod_om[:,:-1]], dim=1)
+        pi_mat = torch.cat([V * prod_prev[:,:self.T-1], prod_prev[:,-1:]], dim=1)
+        pi_mat = pi_mat / pi_mat.sum(dim=1, keepdim=True)
+
+        modes = torch.multinomial(pi_mat, 1).squeeze(1)
+
+        # vectorized sampling per component
+        z = torch.zeros((num_samples, *self.shape), device=device)
+        log_q = torch.zeros(num_samples, device=device)
+        for k, comp in enumerate(self.components):
+            idx = (modes == k).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            z_k, log_q_k = comp.forward(idx.numel())
+            z[idx] = z_k
+            log_q[idx] = log_q_k
+        return z, log_q
+
+    def log_prob(self, z):
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+        log_probs = [comp.log_prob(z) for comp in self.components]
+        log_probs = torch.stack(log_probs, dim=1)
+        return torch.logsumexp(log_probs + log_pi_mean.unsqueeze(0), dim=1)
