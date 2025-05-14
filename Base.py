@@ -247,16 +247,28 @@ class DPGM(BaseDistribution):
         self.log_pi.copy_(log_pi_mean)
 
         # sample stick-breaking vars and modes
-        a = torch.exp(self.log_a).unsqueeze(0)
-        b = torch.exp(self.log_b).unsqueeze(0)
-        U = torch.rand(num_samples, self.T - 1, device=device)
-        V = (1 - (1 - U)**(1.0 / b))**(1.0 / a)
+        a = torch.exp(self.log_a).unsqueeze(0)                   # (1, T-1)
+        b = torch.exp(self.log_b).unsqueeze(0)                   # (1, T-1)
+        U = torch.rand(num_samples, self.T - 1, device=device)   # (N, T-1)
+        V = (1 - (1 - U) ** (1.0 / b)) ** (1.0 / a)
         V = V.clamp(min=1e-6, max=1-1e-6)
-        one_minus_V = 1 - V
-        cumprod_om = torch.cumprod(one_minus_V, dim=1)
-        prod_prev = torch.cat([torch.ones(num_samples,1,device=device), cumprod_om[:,:-1]], dim=1)
-        pi_mat = torch.cat([V * prod_prev[:,:self.T-1], prod_prev[:,-1:]], dim=1)
-        pi_mat = pi_mat / pi_mat.sum(dim=1, keepdim=True)
+
+        one_minus_V = 1 - V                                        # (N, T-1)
+        cumprod_om = torch.cumprod(one_minus_V, dim=1)             # (N, T-1), 마지막 열이 남은 질량
+
+        # 이전까지의 “remaining” 계산
+        prod_prev = torch.cat([
+            torch.ones(num_samples, 1, device=device),            # initial remaining=1
+            cumprod_om[:, :-1]                                     # for k>1
+        ], dim=1)                                                   # (N, T-1)
+
+        # **여기서 잘못된 부분 수정**: 마지막 weight → cumprod_om[:, -1:]
+        remaining = cumprod_om[:, -1:].clone()                     # (N, 1)
+
+        # 각 컴포넌트 weight 계산
+        pis = torch.cat([V * prod_prev, remaining], dim=1)         # (N, T)
+        # (사실 이 합은 항상 1이므로 normalize 불필요하지만 안전하게)
+        pi_mat = pis / pis.sum(dim=1, keepdim=True)                # (N, T)
 
         modes = torch.multinomial(pi_mat, 1).squeeze(1)
 
@@ -691,7 +703,7 @@ class DirichletProcessMixture(BaseDistribution):
             T = T or 30
             comps = []
             for _ in range(T):
-                mean = torch.randn(int(np.prod(self.shape))) * 2.0
+                mean = torch.randn(int(np.prod(self.shape))) * 3.0
                 comps.append(GaussianDistribution(self.shape, mean=mean))
             self.components = nn.ModuleList(comps)
             self.T = T
@@ -732,34 +744,62 @@ class DirichletProcessMixture(BaseDistribution):
 
     def forward(self, num_samples=1):
         device = self.log_alpha.device
+
+        # 1) 기대 혼합비 업데이트(버퍼용)
         pi_mean, log_pi_mean = self._compute_expected_pi()
         self.pi.detach().copy_(pi_mean)
         self.log_pi.detach().copy_(log_pi_mean)
 
-        a = torch.exp(self.log_a).unsqueeze(0)
-        b = torch.exp(self.log_b).unsqueeze(0)
-        U = torch.rand(num_samples, self.T - 1, device=device)
-        V = (1 - (1 - U)**(1.0 / b))**(1.0 / a)
+        # 2) stick-breaking 샘플로 실제 혼합비 행렬 pi_mat 생성
+        a = torch.exp(self.log_a).unsqueeze(0)                   # (1, T-1)
+        b = torch.exp(self.log_b).unsqueeze(0)                   # (1, T-1)
+        U = torch.rand(num_samples, self.T - 1, device=device)   # (N, T-1)
+        V = (1 - (1 - U) ** (1.0 / b)) ** (1.0 / a)
         V = V.clamp(min=1e-6, max=1-1e-6)
 
-        one_minus_V = 1 - V
-        cumprod_om = torch.cumprod(one_minus_V, dim=1)
-        prod_prev = torch.cat([torch.ones(num_samples,1,device=device), cumprod_om[:,:-1]], dim=1)
-        pi_mat = torch.cat([V * prod_prev[:,:self.T-1], prod_prev[:,-1:]], dim=1)
-        pi_mat = pi_mat / pi_mat.sum(dim=1, keepdim=True)
+        one_minus_V = 1 - V                                        # (N, T-1)
+        cumprod_om = torch.cumprod(one_minus_V, dim=1)             # (N, T-1), 마지막 열이 남은 질량
 
-        modes = torch.multinomial(pi_mat, 1).squeeze(1)
+        # 이전까지의 “remaining” 계산
+        prod_prev = torch.cat([
+            torch.ones(num_samples, 1, device=device),            # initial remaining=1
+            cumprod_om[:, :-1]                                     # for k>1
+        ], dim=1)                                                   # (N, T-1)
 
-        # vectorized sampling per component
+        # **여기서 잘못된 부분 수정**: 마지막 weight → cumprod_om[:, -1:]
+        remaining = cumprod_om[:, -1:].clone()                     # (N, 1)
+
+        # 각 컴포넌트 weight 계산
+        pis = torch.cat([V * prod_prev, remaining], dim=1)         # (N, T)
+        # (사실 이 합은 항상 1이므로 normalize 불필요하지만 안전하게)
+        pi_mat = pis / pis.sum(dim=1, keepdim=True)                # (N, T)
+
+        # 3) 샘플별 모드 선택
+        modes = torch.multinomial(pi_mat, num_samples=1, replacement=True).squeeze(1)
+
+        # 4) log π 샘플별로 미리 계산
+        log_pi_mat = torch.log(pi_mat + 1e-12)  # (N, T)
+
+        # 5) 최종 출력 텐서 초기화
         z = torch.zeros((num_samples, *self.shape), device=device)
-        log_q = torch.zeros(num_samples, device=device)
+        log_q = torch.zeros(num_samples,            device=device)
+        
+        # 6) 선택된 모드별로 개별 컴포넌트에서만 forward
         for k, comp in enumerate(self.components):
             idx = (modes == k).nonzero(as_tuple=True)[0]
             if idx.numel() == 0:
                 continue
-            z_k, log_q_k = comp.forward(idx.numel())
+            z_k, _ = comp.forward(idx.numel())  # 샘플 & (여기선 log_q_k 무시)
             z[idx] = z_k
-            log_q[idx] = log_q_k
+
+        # 4) 전체 z에 대한 컴포넌트별 로그밀도 계산
+        #    shape: (num_samples, T)
+        log_probs = torch.stack([comp.log_prob(z) for comp in self.components], dim=1)
+
+        # 5) 기대 혼합비 π_mean을 이용해 혼합분포 로그밀도 계산
+        #    log_q[n] = logsum_j [ log π_mean[j] + log_probs[n,j] ]
+        log_q = torch.logsumexp(log_probs + log_pi_mean.unsqueeze(0), dim=1)
+
         return z, log_q
 
     def log_prob(self, z):
