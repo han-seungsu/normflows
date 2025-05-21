@@ -606,43 +606,82 @@ class GaussianDistribution(BaseDistribution):
         lp = -0.5 * ((z_flat - mu)/sigma)**2 - torch.log(sigma) - 0.5 * np.log(2*pi)
         return lp.sum(dim=1)
 
+import math
+import torch
+import torch.nn as nn
+from torch.distributions import StudentT
+
 class TProductDistribution(BaseDistribution):
     def __init__(self, shape, mean=None, scale=None, df=None):
         super().__init__()
-        if isinstance(shape, int): shape = (shape,)
+        # 1) record event‐shape and flatten‐dim
+        if isinstance(shape, int):
+            shape = (shape,)
         self.shape = shape
-        d = int(np.prod(shape))
+        self.d = int(torch.tensor(shape).prod().item())
+
+        # 2) mean parameter (d,)
         if mean is None:
-            mean = torch.zeros(d)
-        if scale is None:
-            log_scale = torch.zeros(d)
-        else:
-            log_scale = torch.log(torch.tensor(scale, dtype=torch.float32))
-        if df is None:
-            df_buf = torch.full((d,), 2.0)
-        else:
-            df_buf = torch.tensor(df, dtype=torch.float32).view(d,)
+            mean = torch.zeros(self.d)
+        mean = torch.as_tensor(mean, dtype=torch.float32).view(self.d)
         self.mean = nn.Parameter(mean)
+
+        # 3) log‐scale parameter (d,)
+        if scale is None:
+            log_scale = torch.zeros(self.d)
+        else:
+            log_scale = torch.log(torch.as_tensor(scale, dtype=torch.float32).view(self.d))
         self.log_scale = nn.Parameter(log_scale)
-        self.register_buffer('df', df_buf)
+
+        # 4) df buffer (d,)
+        if df is None:
+            df_buf = torch.full((self.d,), 2.0)
+        else:
+            df_buf = torch.as_tensor(df, dtype=torch.float32).view(self.d)
+        self.register_buffer("df", df_buf)
 
     def forward(self, num_samples=1):
-        df = self.df.view(1, *self.shape)
-        eps = torch.distributions.StudentT(df).rsample((num_samples,))
-        scale = torch.exp(self.log_scale).view(1, *self.shape)
-        samples = eps * scale + self.mean.view(1, *self.shape)
+        # a) create a batch of StudentT’s over each of d dims
+        #    StudentT(df) has batch_shape=(d,), event_shape=()
+        student = StudentT(self.df)
+
+        # b) rsample yields (num_samples, d)
+        eps = student.rsample((num_samples,))
+
+        # c) scale & shift, then reshape back to (N,*shape)
+        scale = torch.exp(self.log_scale)
+        samples_flat = eps * scale + self.mean     # (N,d)
+        samples = samples_flat.view(num_samples, *self.shape)
+
+        # d) compute log‐density
         log_p = self.log_prob(samples)
         return samples, log_p
 
     def log_prob(self, z):
-        z_flat = z.view(z.shape[0], -1)
-        mu = self.mean.view(1, -1)
-        sigma = torch.exp(self.log_scale).view(1, -1)
-        df = self.df.view(1, -1)
-        x = (z_flat - mu) / sigma
-        coef = lgamma((df+1)/2) - lgamma(df/2) - 0.5*(torch.log(df*pi) + 2*torch.log(sigma))
-        lp = coef - ((df+1)/2)*torch.log(1 + x**2/df)
-        return lp.sum(dim=1)
+        # flatten to (N,d)
+        N = z.shape[0]
+        z_flat = z.view(N, -1)
+
+        # broadcast parameters to (N,d)
+        mu    = self.mean.unsqueeze(0)                 # (1,d)
+        sigma = torch.exp(self.log_scale).unsqueeze(0)  # (1,d)
+        df    = self.df.unsqueeze(0)                    # (1,d)
+
+        # standardize
+        x = (z_flat - mu) / sigma                       # (N,d)
+
+        # log‐pdf of StudentT:
+        #   lgamma((ν+1)/2) − lgamma(ν/2) − ½[ ln(νπ) + 2 ln σ ]
+        #   − (ν+1)/2 · ln(1 + x²/ν)
+        coef = (
+            torch.lgamma((df + 1.0) / 2.0)
+            - torch.lgamma(df / 2.0)
+            - 0.5 * (torch.log(df * np.pi) + 2.0 * torch.log(sigma))
+        )                                               # (1,d) → broadcast
+
+        lp = coef - ((df + 1.0) / 2.0) * torch.log1p(x * x / df)  # (N,d)
+        return lp.sum(dim=1)                            # (N,)
+
 
 class MultivariateTDistribution(BaseDistribution):
     def __init__(self, shape, mean=None, scale=None, df=None):
@@ -703,7 +742,7 @@ class DirichletProcessMixture(BaseDistribution):
             T = T or 30
             comps = []
             for _ in range(T):
-                mean = torch.randn(int(np.prod(self.shape))) * 3.0
+                mean = torch.randn(int(np.prod(self.shape))) * 2.0
                 comps.append(GaussianDistribution(self.shape, mean=mean))
             self.components = nn.ModuleList(comps)
             self.T = T
@@ -711,7 +750,7 @@ class DirichletProcessMixture(BaseDistribution):
             self.components = nn.ModuleList(components)
             self.T = len(self.components) if T is None else T
             assert self.T == len(self.components), "T must match number of components"
-
+        
         # concentration alpha
         init_alpha = torch.tensor(alpha, dtype=torch.float32)
         if train_alpha:
@@ -731,6 +770,8 @@ class DirichletProcessMixture(BaseDistribution):
         self.log_pi.detach().copy_(log_pi_mean)
 
     def _compute_expected_pi(self):
+        if self.T == 1:
+            return torch.tensor([1.0]), torch.tensor([0.0])
         a = torch.exp(self.log_a)
         b = torch.exp(self.log_b)
         v_mean = a / (a + b)
@@ -751,6 +792,12 @@ class DirichletProcessMixture(BaseDistribution):
         self.log_pi.detach().copy_(log_pi_mean)
 
         # 2) stick-breaking 샘플로 실제 혼합비 행렬 pi_mat 생성
+        if self.T == 1:
+            # just delegate entirely to the single Gaussian
+            z, _ = self.components[0].forward(num_samples)       # [N,*shape]
+            log_q = self.components[0].log_prob(z)               # [N]
+            return z, log_q
+        
         a = torch.exp(self.log_a).unsqueeze(0)                   # (1, T-1)
         b = torch.exp(self.log_b).unsqueeze(0)                   # (1, T-1)
         U = torch.rand(num_samples, self.T - 1, device=device)   # (N, T-1)
@@ -803,6 +850,8 @@ class DirichletProcessMixture(BaseDistribution):
         return z, log_q
 
     def log_prob(self, z):
+        if self.T == 1:
+            return self.components[0].log_prob(z)
         pi_mean, log_pi_mean = self._compute_expected_pi()
         self.pi.detach().copy_(pi_mean)
         self.log_pi.detach().copy_(log_pi_mean)
@@ -810,3 +859,125 @@ class DirichletProcessMixture(BaseDistribution):
         log_probs = [comp.log_prob(z) for comp in self.components]
         log_probs = torch.stack(log_probs, dim=1)
         return torch.logsumexp(log_probs + log_pi_mean.unsqueeze(0), dim=1)
+    
+import torch.nn.functional as F
+
+class DirichletProcessMixture_Gumbel(BaseDistribution):
+    def __init__(
+        self,
+        shape,
+        components=None,
+        T=None,
+        alpha=1.0,
+        train_alpha=True,
+        tau=1.0,            # Gumbel-Softmax 온도
+    ):
+        super().__init__()
+        # --- shape 기록 ---
+        if isinstance(shape, int):
+            shape = (shape,)
+        self.shape = shape
+
+        # --- 컴포넌트 초기화 ---
+        if components is None:
+            T = T or 30
+            comps = []
+            for _ in range(T):
+                mean = torch.randn(int(np.prod(self.shape))) * 3.0
+                comps.append(GaussianDistribution(self.shape, mean=mean))
+            self.components = nn.ModuleList(comps)
+            self.T = T
+        else:
+            self.components = nn.ModuleList(components)
+            self.T = len(components) if T is None else T
+            assert self.T == len(self.components), "T must match number of components"
+
+        # --- Gumbel-Softmax temperature ---
+        self.tau = tau
+
+        # --- DP stick-breaking hyper ---
+        init_alpha = torch.tensor(alpha)
+        if train_alpha:
+            self.log_alpha = nn.Parameter(torch.log(init_alpha))
+        else:
+            self.register_buffer("log_alpha", torch.log(init_alpha))
+
+        # --- variational a,b ---
+        #self.log_a = nn.Parameter(torch.zeros(self.T - 1))
+        self.register_buffer("log_a", torch.zeros(self.T - 1))
+        self.log_b = nn.Parameter(torch.log(torch.ones(self.T - 1) * alpha))
+
+        # --- buffers for expected π ---
+        self.register_buffer("pi", torch.zeros(self.T))
+        self.register_buffer("log_pi", torch.zeros(self.T))
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+    def _compute_expected_pi(self):
+        a = torch.exp(self.log_a)
+        b = torch.exp(self.log_b)
+        v_mean = a / (a + b)
+        pis = []
+        rem = torch.ones((), device=a.device)
+        for k in range(self.T - 1):
+            pis.append(v_mean[k] * rem)
+            rem = rem * (1 - v_mean[k])
+        pis.append(rem)
+        pi_mean = torch.stack(pis, dim=0)
+        return pi_mean, torch.log(pi_mean + 1e-12)
+
+    def forward(self, num_samples=1):
+        # 1) update expected π for buffers (no grad)
+        device = self.log_alpha.device
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+        # 2) sample Kumaraswamy V → build pi_mat
+        a = torch.exp(self.log_a).clamp(min=1e-3, max=1e3)
+        b = torch.exp(self.log_b).clamp(min=1e-3, max=1e3)
+
+        # then
+        U = torch.rand(num_samples, self.T-1, device=device)
+        V = (1 - (1 - U)**(1.0 / b))**(1.0 / a)
+        V = V.clamp(1e-6, 1 - 1e-6)
+        one_minus = 1 - V
+        cumprod_om = torch.cumprod(one_minus, dim=1)
+        prod_prev = torch.cat([torch.ones(num_samples,1,device=device), cumprod_om], dim=1)
+        pis = torch.cat([V * prod_prev[:, :self.T-1], prod_prev[:, self.T-1:]], dim=1)
+        pi_mat = pis / pis.sum(dim=1, keepdim=True)  # [N,T]
+
+        # 3) Gumbel-Softmax to get soft assignments y[n,k]
+        logits = torch.log(pi_mat + 1e-12)
+        y = F.gumbel_softmax(logits, tau=self.tau, hard=False, dim=1)  # [N,T]
+
+        # 4) parallel sample from each component
+        zs = []
+        log_qz = []
+        for comp in self.components:
+            z_k, lq_k = comp.forward(num_samples)
+            zs.append(z_k)       # each [N,*shape]
+            log_qz.append(lq_k)  # each [N]
+        zs = torch.stack(zs, dim=1)       # [N,T,*shape]
+        log_qz = torch.stack(log_qz, dim=1)  # [N,T]
+
+        # 5) combine by soft weights
+        z = (y.unsqueeze(-1) * zs).sum(dim=1)        # [N,*shape]
+        comp_log_qz = (y * log_qz).sum(dim=1)        # [N]
+
+        # 6) discrete log-q(c|V)
+        log_qmode = (y * logits).sum(dim=1)          # [N]
+
+        # 7) joint variational log-density
+        log_q = comp_log_qz + log_qmode
+        return z, log_q
+
+    def log_prob(self, z):
+        pi_mean, log_pi_mean = self._compute_expected_pi()
+        self.pi.detach().copy_(pi_mean)
+        self.log_pi.detach().copy_(log_pi_mean)
+
+        log_ps = [comp.log_prob(z) for comp in self.components]
+        log_ps = torch.stack(log_ps, dim=1)
+        return torch.logsumexp(log_ps + log_pi_mean.unsqueeze(0), dim=1)

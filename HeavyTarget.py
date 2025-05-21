@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.distributions import MultivariateNormal, Chi2, StudentT
+from torch.distributions import MultivariateNormal, Chi2, StudentT, Gamma
 import numpy as np
 
 # normflows 패키지의 Base 클래스와 Target 클래스가 있다고 가정
@@ -358,7 +358,6 @@ class SymmetricParetoMixture(Target):
             x_out[i, :] = pareto_part[i, :] + self.mean[k, :]
         return x_out
 
-
 class MixtureTarget(Target):
     def __init__(self, target1, target2, weight=None, truncation=None):
         """
@@ -437,3 +436,73 @@ class ConstantNormal(Target):
         logp = self.standard_normal.log_prob(z).sum(dim=-1)  # 차원마다 log_prob 합
         return logp + self.const
     
+class GaussianDistribution(Target):
+    def __init__(self, shape, mean=None, scale=None):
+        super().__init__()
+        if isinstance(shape, int): shape = (shape,)
+        self.shape = shape
+        d = int(np.prod(shape))
+        if mean is None:
+            mean = torch.zeros(d)
+        if scale is None:
+            log_scale = torch.zeros(d)
+        else:
+            log_scale = torch.log(torch.tensor(scale, dtype=torch.float32))
+        self.mean = nn.Parameter(mean)
+        self.log_scale = nn.Parameter(log_scale)
+
+    def sample(self, num_samples=1):
+        eps = torch.randn(num_samples, *self.shape, device=self.mean.device)
+        scale = torch.exp(self.log_scale).view(1, *self.shape)
+        samples = eps * scale + self.mean.view(1, *self.shape)
+        log_p = self.log_prob(samples)
+        return samples
+
+    def log_prob(self, z):
+        z_flat = z.view(z.shape[0], -1)
+        mu = self.mean.view(1, -1)
+        sigma = torch.exp(self.log_scale).view(1, -1)
+        lp = -0.5 * ((z_flat - mu)/sigma)**2 - torch.log(sigma) - 0.5 * np.log(2*pi)
+        return lp.sum(dim=1)
+
+class NormalInvGammaPosterior(Target):
+    def __init__(self, mu_n, kappa_n, alpha_n, beta_n):
+        self.mu_n, self.kappa_n = mu_n, kappa_n
+        self.alpha_n, self.beta_n = alpha_n, beta_n
+        # Inv-Gamma 샘플링을 위해 내부적으로 Gamma 분포 사용
+        self._gamma = Gamma(alpha_n, beta_n)
+
+    def sample(self, num_samples=1):
+        # sigma^2 ~ Inv-Gamma(alpha_n, beta_n)
+        gamma_samps = self._gamma.sample((num_samples,))        # [S]
+        sigma2_samps = 1.0 / gamma_samps                        # [S]
+        # mu | sigma^2 ~ Normal(mu_n, sigma2 / kappa_n)
+        std = (sigma2_samps / self.kappa_n).sqrt()              # [S]
+        #mu_samps = Normal(self.mu_n, std).sample()              # [S]
+        mu_samps = torch.randn_like(std) * std + self.mu_n  # [S]
+        # 결과를 [S,2] 형태로 묶어 반환
+        return torch.stack([mu_samps, sigma2_samps], dim=-1)    # [S, 2]
+
+    def log_prob(self, samples):
+        """
+        samples: Tensor[..., 2], last-dim이 (mu, sigma2).
+        반환: Tensor[...] 로 각 샘플의 joint log-density.
+        """
+        mu     = samples[..., 0]
+        sigma2 = samples[..., 1]
+
+        a, b = self.alpha_n, self.beta_n
+        # p(sigma2) 부분 (Inv-Gamma)
+        logp_sigma2 = (
+            a * torch.log(b)
+            - torch.lgamma(a)
+            - (a + 1) * torch.log(sigma2)
+            - b / sigma2
+        )
+
+        # p(mu | sigma2) 부분 (Normal)
+        var_mu = sigma2 / self.kappa_n
+        std_mu = var_mu.sqrt()
+        logp_mu = Normal(self.mu_n, std_mu).log_prob(mu)
+
+        return logp_sigma2 + logp_mu
